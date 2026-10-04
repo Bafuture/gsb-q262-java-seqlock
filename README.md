@@ -30,3 +30,63 @@ Pair-wise GSB 标注任务仓库（第 17 批 / 262）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+# Seqlock 组件设计与实现说明
+
+实现位于 `src/main/java/com/example/gsb/seqlock/`：
+
+| 类 | 职责 |
+|----|------|
+| `Seqlock<T>` | 序列锁本体：版本号协议、写者优先、读者自旋重试、超限策略、统计 |
+| `OverflowPolicy` | 重试超限处理：`THROW`（快速失败）/ `BLOCK`（兜底阻塞） |
+| `RetryLimitExceededException` | THROW 策略下超限抛出的异常（携带重试次数与上限） |
+| `SeqlockStats` | 读取次数、重试次数、重试率、单次最大重试、兜底次数 |
+| `PairData` | 示例复合数据，不变式 `a + b == SUM`，用于压测验证不撕裂 |
+
+## 1. 版本号协议
+
+- `sequence` 为 `volatile int`：偶数 = 稳定版本，奇数 = 写者临界区进行中。
+- 写者：`mutex.lock() → seq++（变奇）→ 原地修改全部字段 → seq++（变偶，发布）→ unlock()`。
+- 读者：`s1 = seq`；若 `s1` 为奇数直接重试；否则复制全部字段；`s2 = seq`；当且仅当 `s1 == s2` 时快照有效，否则丢弃重试。
+- 内存语义：写者第二次 `volatile` 写具备 release 语义；读者第一次 `volatile` 读具备 acquire 语义，保证字段读不会被提升到版本读之前。**关键细节**：JMM 并不禁止字段普通读被 JIT *下移*到第二次 `volatile` 读之后（volatile 读只阻止后续操作前移），因此复制与第二次版本读之间必须显式插入 `VarHandle.loadLoadFence()`（x86 上仅是编译器屏障、无 CPU 开销；压测在缺少该屏障时确实观测到撕裂，加入后长压测稳定通过）。
+- 检测原理：版本号单调递增。第二次读到与第一次相同的偶数 `v`，意味着连写者第一次 `seq++`（奇数）都尚未对读者可见；而写者的所有字段写都排在该 `volatile` 写之前，故不可能有任何字段写对读者可见，多字段必然整体属于版本 `v`。复制期间若有写者进入（版本变奇）或恰好完成一整次写入（版本 +2），`s1 != s2` 必然被检测到。
+
+## 2. 写者优先：为什么读写之间不需要互斥
+
+- 读者只读不改，读到中间态的唯一后果是版本校验失败、丢弃结果重试——不会破坏数据，也不会阻塞写者。
+- 写者的中间态永远不会作为有效快照返回（版本必然变奇或 +2）。
+- 因此读者与写者之间不存在需要互斥的临界区；唯一的互斥是一把 `ReentrantLock`（公平），只用于**写者之间**串行化 `seq++/修改/seq++` 序列，防止两个写者交错破坏版本协议。写者永远不被读者阻塞，写延迟只取决于其它写者。
+
+## 3. 读者自旋重试与超限处理
+
+- 默认重试上限 `Seqlock.DEFAULT_MAX_RETRIES = 1024`（构造时可配，0 表示发现不一致立即超限）。
+- 退避策略：前 16 轮 `Thread.onSpinWait()`，随后 `Thread.yield()`，再往后 1µs 起步、上限 64µs 的 `parkNanos` 指数退避，避免无界自旋烧 CPU 并降低缓存一致性流量。
+- 超限后按 `OverflowPolicy` 处理：
+  - `THROW`：抛出 `RetryLimitExceededException`，调用方快速失败、自行降级；
+  - `BLOCK`：退化为竞争写者互斥锁（公平锁）。持锁期间任何写者都不可能处于临界区，无需再校验版本即可复制出一致快照，保证读者最终一定能读到。
+
+## 4. 复合结构一致性
+
+`Seqlock<T>` 通过构造时注入的 `copier (from, to)` 在一次有效版本窗口内把**全部**字段复制到调用方缓冲（`read(into)` 零分配，或 `read(Supplier)` 每次新分配）。版本校验保证这批字段整体来自同一个已提交版本。
+
+## 5. 读者饥饿：成因与缓解
+
+- 成因：写者临界区过长、或写者源源不断时，读者可能持续校验失败而饥饿。
+- 本组件的缓解：有限重试 + 有界退避；`THROW` 快速失败避免无限自旋；`BLOCK` 兜底给读者一条有界等待、保证进展的退路（公平锁排队，不会被写者无限插队）。
+- 使用侧建议：尽量缩短写临界区、批量合并写入、保持单写者/少写者纪律；读多写少正是 seqlock 的适用场景。
+
+## 6. 统计口径（`SeqlockStats`）
+
+- `readCalls`：`read` 调用次数；`attempts`：尝试总轮数；`retries = attempts - readCalls`。
+- `retryRate = retries / attempts`（重试轮数占比，[0,1)）；`maxRetriesPerRead`：单次读取经历的最大重试轮数；`fallbackReads`：BLOCK 兜底次数。
+- 基于 `LongAdder` / `LongAccumulator`，统计开销对读者路径可忽略；`snapshot()` 返回不可变快照，`reset()` 清零。
+
+## 7. 测试
+
+`src/test/java/com/example/gsb/seqlock/` 覆盖：版本校验（`VersionValidationTest`）、字段一致性与确定性撕裂重试（`FieldConsistencyTest`）、重试上限与两种超限策略（`RetryLimitTest`）、多写者多读者压测不撕裂（`ConcurrentNoTearStressTest`，断言 `a + b == SUM` 恒成立）、统计口径（`StatsTest`）。
+
+```bash
+./mvnw -q verify
+```
